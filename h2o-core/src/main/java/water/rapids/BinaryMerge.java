@@ -30,7 +30,7 @@ class BinaryMerge extends DTask<BinaryMerge> {
 
   private final int _numJoinCols;
   private transient long _leftFrom;
-  private transient int _retBatchSize;
+  private transient int _retBatchSize; // no need to match batchsize of RadixOrder.
 
   private final boolean _allLeft, _allRight;
   private boolean[] _stringCols;
@@ -65,7 +65,7 @@ class BinaryMerge extends DTask<BinaryMerge> {
       _base = base;
       // Create fast lookups to go from chunk index to node index of that chunk
       Vec vec = _vec = frame.anyVec();
-      _chunkNode = vec==null ? null : new int[vec.nChunks()];
+      _chunkNode = vec==null ? null : MemoryManager.malloc4(vec.nChunks());
       if( vec == null ) return; // Zero-columns for Sort
       for( int i=0; i<_chunkNode.length; i++ )
         _chunkNode[i] = vec.chunkKey(i).home_node().index();
@@ -93,7 +93,7 @@ class BinaryMerge extends DTask<BinaryMerge> {
     _allRight = false;  // TODO: pass through
     int columnsInResult = (_leftSB._frame == null?0:_leftSB._frame.numCols()) +
             (_riteSB._frame == null?0:_riteSB._frame.numCols())-_numJoinCols;
-    _stringCols = new boolean[columnsInResult];
+    _stringCols = MemoryManager.mallocZ(columnsInResult);
     // check left frame first
     if (_leftSB._frame!=null) {
       for (int col = _numJoinCols; col < _leftSB._frame.numCols(); col++) {
@@ -114,7 +114,7 @@ class BinaryMerge extends DTask<BinaryMerge> {
 
   @Override
   public void compute2() {
-    _timings = new double[20];
+    _timings = MemoryManager.malloc8d(20);
     long t0 = System.nanoTime();
 
     SingleThreadRadixOrder.OXHeader leftSortedOXHeader = DKV.getGet(getSortedOXHeaderKey(/*left=*/true, _leftSB._msb));
@@ -181,7 +181,9 @@ class BinaryMerge extends DTask<BinaryMerge> {
     long retSize = leftTo - _leftFrom - 1;   // since leftTo and leftFrom are 1 outside the extremes
     assert retSize >= 0;
     if (retSize==0) { tryComplete(); return; } // nothing can match, even when allLeft
-    _retBatchSize = 268435456;    // 2^31 / 8 since Java arrays are limited to 2^31 bytes
+
+   // _retBatchSize = 268435456;  // 2^31 / 8 since Java arrays are limited to 2^31 bytes, original number
+    _retBatchSize = 10000 ;   // must set to be the same from RadixOrder.java
     int retNBatch = (int)((retSize - 1) / _retBatchSize + 1);
     int retLastSize = (int)(retSize - (retNBatch - 1) * _retBatchSize);
 
@@ -224,7 +226,7 @@ class BinaryMerge extends DTask<BinaryMerge> {
 
   // Holder for Key & Order info
   private static class KeyOrder {
-    private final transient long _batchSize;
+    public final transient long _batchSize;
     private final transient byte _key  [/*n2GB*/][/*i mod 2GB * _keySize*/];
     private final transient long _order[/*n2GB*/][/*i mod 2GB * _keySize*/];
     private final transient long _perNodeNumRowsToFetch[];
@@ -250,8 +252,8 @@ class BinaryMerge extends DTask<BinaryMerge> {
     // Do a mod/div long _order array lookup
     long at8order( long idx ) { return _order[(int)(idx / _batchSize)][(int)(idx % _batchSize)]; }
 
-    long[][] fillPerNodeRows( int i ) {
-      final int batchSizeLong = 256*1024*1024 / 16;  // 256GB DKV limit / sizeof(UUID)
+    long[][] fillPerNodeRows( int i, final int batchSizeLong) {
+     // final int batchSizeLong = 256*1024*1024 / 16;  // 256GB DKV limit / sizeof(UUID)
       if( _perNodeNumRowsToFetch[i] <= 0 ) return null;
       int nbatch  = (int) ((_perNodeNumRowsToFetch[i] - 1) / batchSizeLong + 1);  // TODO: wrap in class to avoid this boiler plate
       assert nbatch >= 1;
@@ -496,25 +498,27 @@ class BinaryMerge extends DTask<BinaryMerge> {
     final int cloudSize = H2O.CLOUD.size();
     final long perNodeRightRows[][][] = new long[cloudSize][][];
     final long perNodeLeftRows [][][] = new long[cloudSize][][];
+
     // Allocate memory to split this MSB combn's left and right matching rows
     // into contiguous batches sent to the nodes they reside on
     for( int i = 0; i < cloudSize; i++ ) {
-      perNodeRightRows[i] = _riteKO.fillPerNodeRows(i);
-      perNodeLeftRows [i] = _leftKO.fillPerNodeRows(i);
+      perNodeRightRows[i] = _riteKO.fillPerNodeRows(i, (int) _riteKO._batchSize);
+      perNodeLeftRows [i] = _leftKO.fillPerNodeRows(i, (int) _leftKO._batchSize);
     }
     _timings[2] += ((t1=System.nanoTime()) - t0) / 1e9; t0=t1;
 
     // Loop over _ret1st and _retLen and populate the batched requests for
     // each node helper.  _ret1st and _retLen are the same shape
-    final long perNodeRightLoc[] = new long[cloudSize];
-    final long perNodeLeftLoc [] = new long[cloudSize];
+    final long perNodeRightLoc[] = MemoryManager.malloc8(cloudSize);
+    final long perNodeLeftLoc [] = MemoryManager.malloc8(cloudSize);
     chunksPopulatePerNode(perNodeLeftLoc,perNodeLeftRows,perNodeRightLoc,perNodeRightRows);
     _timings[3] += ((t1=System.nanoTime()) - t0) / 1e9; t0=t1;
 
     // Create the chunks for the final frame from this MSB pair.
     
     // 16 bytes for each UUID (biggest type). Enum will be long (8). TODO: How is non-Enum 'string' handled by H2O?
-    final int batchSizeUUID = 256*1024*1024 / 16;  // number of rows per chunk to fit in 256GB DKV limit.
+   // final int batchSizeUUID = 256*1024*1024 / 16;  // number of rows per chunk to fit in 256GB DKV limit.
+    final int batchSizeUUID = _retBatchSize;
     final int nbatch = (int) ((_numRowsInResult-1)/batchSizeUUID +1);  // TODO: wrap in class to avoid this boiler plate
     assert nbatch >= 1;
     final int lastSize = (int) (_numRowsInResult - (nbatch-1)*batchSizeUUID);
@@ -522,44 +526,49 @@ class BinaryMerge extends DTask<BinaryMerge> {
     final int numLeftCols = _leftSB._frame.numCols();
     final int numColsInResult = _leftSB._frame.numCols() + _riteSB._frame.numCols() - _numJoinCols;
     final double[][][] frameLikeChunks = new double[numColsInResult][nbatch][]; //TODO: compression via int types
-    BufferedString[][][] frameLikeChunks4Strings = new BufferedString[numColsInResult][nbatch][]; // cannot allocate before hand
+    final BufferedString[][][] frameLikeChunks4Strings = new BufferedString[numColsInResult][nbatch][]; // cannot allocate before hand
     _chunkSizes = new int[nbatch];
+    long resultLoc = 0;
 
-    for (int col = 0; col < numColsInResult; col++) {
-      if (this._stringCols[col]) {
-        for (int b = 0; b < nbatch; b++) {
+    for (int b=0; b < nbatch; b++) {
+      for (int col = 0; col < numColsInResult; col++) {  // allocate memory for frameLikeChunks
+        if (this._stringCols[col]) {
           frameLikeChunks4Strings[col][b] = new BufferedString[_chunkSizes[b] = (b == nbatch - 1 ? lastSize : batchSizeUUID)];
-        }
-      } else {
-        for (int b = 0; b < nbatch; b++) {
+        } else {
           frameLikeChunks[col][b] = MemoryManager.malloc8d(_chunkSizes[b] = (b == nbatch - 1 ? lastSize : batchSizeUUID));
           Arrays.fill(frameLikeChunks[col][b], Double.NaN);
           // NA by default to save filling with NA for nomatches when allLeft
         }
       }
+
+
+        _timings[4] += ((t1 = System.nanoTime()) - t0) / 1e9;
+        t0 = t1;
+
+        // Get Raw Remote Rows
+        final GetRawRemoteRows grrrsLeft[][] = new GetRawRemoteRows[cloudSize][];
+        final GetRawRemoteRows grrrsRite[][] = new GetRawRemoteRows[cloudSize][];
+        chunksGetRawRemoteRows(perNodeLeftRows, perNodeRightRows, grrrsLeft, grrrsRite, b);
+        _timings[6] += ((t1 = System.nanoTime()) - t0) / 1e9;
+        t0 = t1;  // all this time is expected to be in [5]
+
+        // Now loop through _ret1st and _retLen and populate
+        resultLoc = chunksPopulateRetFirst(resultLoc, b, numColsInResult, numLeftCols, perNodeLeftLoc, grrrsLeft, perNodeRightLoc, grrrsRite, frameLikeChunks, frameLikeChunks4Strings);
+        _timings[10] += ((t1 = System.nanoTime()) - t0) / 1e9;
+        t0 = t1;
+        // compress all chunks and store them
+        chunksCompressAndStore(b, numColsInResult, frameLikeChunks, frameLikeChunks4Strings);
+        cleanUpMemory(grrrsLeft, b);  // clean up memory used by grrrsLeft and grrrsRite
+        cleanUpMemory(grrrsRite, b);
     }
 
-    _timings[4] += ((t1=System.nanoTime()) - t0) / 1e9; t0=t1;
-
-    // Get Raw Remote Rows
-    final GetRawRemoteRows grrrsLeft[][] = new GetRawRemoteRows[cloudSize][];
-    final GetRawRemoteRows grrrsRite[][] = new GetRawRemoteRows[cloudSize][];
-    chunksGetRawRemoteRows(perNodeLeftRows,perNodeRightRows,grrrsLeft,grrrsRite);
-    _timings[6] += ((t1=System.nanoTime()) - t0) / 1e9; t0=t1;  // all this time is expected to be in [5]
-
-    // Now loop through _ret1st and _retLen and populate
-    chunksPopulateRetFirst(numColsInResult, numLeftCols, perNodeLeftLoc, grrrsLeft, perNodeRightLoc, grrrsRite, frameLikeChunks, frameLikeChunks4Strings);
-    _timings[10] += ((t1=System.nanoTime()) - t0) / 1e9; t0=t1;
-
-    // compress all chunks and store them
-    chunksCompressAndStore(nbatch, numColsInResult, frameLikeChunks, frameLikeChunks4Strings);
     _timings[11] += (System.nanoTime() - t0) / 1e9;
   }
 
   // Loop over _ret1st and _retLen and populate the batched requests for
   // each node helper.  _ret1st and _retLen are the same shape
   private void chunksPopulatePerNode( final long perNodeLeftLoc[], final long perNodeLeftRows[][][], final long perNodeRightLoc[], final long perNodeRightRows[][][] ) {
-    final int batchSizeLong = 256*1024*1024 / 16;  // 256GB DKV limit / sizeof(UUID)
+    final int batchSizeLong = _retBatchSize;  // 256GB DKV limit / sizeof(UUID)
     long prevf = -1, prevl = -1;
     // TODO: hop back to original order here for [] syntax.
     long leftLoc=_leftFrom;  // sweep through left table along the sorted row locations.  
@@ -581,8 +590,8 @@ class BinaryMerge extends DTask<BinaryMerge> {
           // TODO could loop through batches rather than / and % wastefully
           long row = _leftKO.at8order(leftLoc);
           int chkIdx = _leftSB._vec.elem2ChunkIdx(row); //binary search in espc
-          int ni = _leftSB._chunkNode[chkIdx];
-          long pnl = perNodeLeftLoc[ni]++;   // pnl = per node location
+          int ni = _leftSB._chunkNode[chkIdx]; // node index
+          long pnl = perNodeLeftLoc[ni]++;    // pnl = per node location
           perNodeLeftRows[ni][(int)(pnl/batchSizeLong)][(int)(pnl%batchSizeLong)] = row;  // ask that node for global row number row
         }
         if (f==0) continue;
@@ -610,51 +619,56 @@ class BinaryMerge extends DTask<BinaryMerge> {
   }
 
   // Get Raw Remote Rows
-  private void chunksGetRawRemoteRows(final long perNodeLeftRows[][][], final long perNodeRightRows[][][], GetRawRemoteRows grrrsLeft[][], GetRawRemoteRows grrrsRite[][]) {
+  private void chunksGetRawRemoteRows(final long perNodeLeftRows[][][], final long perNodeRightRows[][][], GetRawRemoteRows grrrsLeft[][], GetRawRemoteRows grrrsRite[][], int batchNumber) {
     RPC<GetRawRemoteRows> grrrsRiteRPC[][] = new RPC[H2O.CLOUD.size()][];
     RPC<GetRawRemoteRows> grrrsLeftRPC[][] = new RPC[H2O.CLOUD.size()][];
 
     // Launch remote tasks left and right
     for( H2ONode node : H2O.CLOUD._memary ) {
       final int ni = node.index();
-      final int bUppRite = perNodeRightRows[ni] == null ? 0 : perNodeRightRows[ni].length;
-      final int bUppLeft =  perNodeLeftRows[ni] == null ? 0 :  perNodeLeftRows[ni].length;
+      final int bUppRite = perNodeRightRows[ni] == null ? 0 : perNodeRightRows[ni].length;  // denote nbatch
+      final int bUppLeft =  perNodeLeftRows[ni] == null ? 0 :  perNodeLeftRows[ni].length;  // denote nbatch
       grrrsRiteRPC[ni] = new RPC[bUppRite];
       grrrsLeftRPC[ni] = new RPC[bUppLeft];
       grrrsRite[ni] = new GetRawRemoteRows[bUppRite];
       grrrsLeft[ni] = new GetRawRemoteRows[bUppLeft];
-      for (int b = 0; b < bUppRite; b++) {
+     // for (int b = 0; b < bUppRite; b++) {
         // TODO try again now with better surrounding method
-        // Arrays.sort(perNodeRightRows[ni][b]);  Simple quick test of fetching in monotonic order. Doesn't seem to help so far. 
-        grrrsRiteRPC[ni][b] = new RPC<>(node, new GetRawRemoteRows(_riteSB._frame, perNodeRightRows[ni][b])).call();
+        // Arrays.sort(perNodeRightRows[ni][b]);  Simple quick test of fetching in monotonic order. Doesn't seem to help so far.
+      if (batchNumber < bUppRite) {
+        grrrsRiteRPC[ni][batchNumber] = new RPC<>(node, new GetRawRemoteRows(_riteSB._frame, perNodeRightRows[ni][batchNumber])).call();
       }
-      for (int b = 0; b < bUppLeft; b++) {
+     // }
+     // for (int b = 0; b < bUppLeft; b++) {
         // Arrays.sort(perNodeLeftRows[ni][b]);
-        grrrsLeftRPC[ni][b] = new RPC<>(node, new GetRawRemoteRows(_leftSB._frame, perNodeLeftRows[ni][b])).call();
+      if (batchNumber < bUppLeft) {
+        grrrsLeftRPC[ni][batchNumber] = new RPC<>(node, new GetRawRemoteRows(_leftSB._frame, perNodeLeftRows[ni][batchNumber])).call();
       }
+     // }
     }
     for( H2ONode node : H2O.CLOUD._memary ) {
       // TODO: just send and wait for first batch on each node and then .get() next batch as needed.
       int ni = node.index();
       final int bUppRite = perNodeRightRows[ni] == null ? 0 : perNodeRightRows[ni].length;
-      for (int b = 0; b < bUppRite; b++)
-        _timings[5] += (grrrsRite[ni][b] = grrrsRiteRPC[ni][b].get()).timeTaken;
+      if (batchNumber < bUppRite)
+        _timings[5] += (grrrsRite[ni][batchNumber] = grrrsRiteRPC[ni][batchNumber].get()).timeTaken;
       final int bUppLeft = perNodeLeftRows[ni] == null ? 0 :  perNodeLeftRows[ni].length;
-      for (int b = 0; b < bUppLeft; b++)
-        _timings[5] += (grrrsLeft[ni][b] = grrrsLeftRPC[ni][b].get()).timeTaken;
+      if (batchNumber < bUppLeft)
+        _timings[5] += (grrrsLeft[ni][batchNumber] = grrrsLeftRPC[ni][batchNumber].get()).timeTaken;
     }
   }
 
   // Now loop through _ret1st and _retLen and populate
-  private void chunksPopulateRetFirst(final int numColsInResult, final int numLeftCols, final long perNodeLeftLoc[], final GetRawRemoteRows grrrsLeft[][], final long perNodeRightLoc[], final GetRawRemoteRows grrrsRite[][], final double[][][] frameLikeChunks, BufferedString[][][] frameLikeChunks4String) {
+  private long chunksPopulateRetFirst(long resultLoc, final int jb, final int numColsInResult, final int numLeftCols, final long perNodeLeftLoc[], final GetRawRemoteRows grrrsLeft[][], final long perNodeRightLoc[], final GetRawRemoteRows grrrsRite[][], final double[][][] frameLikeChunks, BufferedString[][][] frameLikeChunks4String) {
     // 16 bytes for each UUID (biggest type). Enum will be long (8). 
     // TODO: How is non-Enum 'string' handled by H2O?
-    final int batchSizeUUID = 256*1024*1024 / 16;  // number of rows per chunk to fit in 256GB DKV limit.
-    long resultLoc=0;   // sweep upwards through the final result, filling it in
+    final int batchSizeUUID = _retBatchSize;  // number of rows per chunk to fit in 256GB DKV limit.
+   // long resultLoc=0;   // sweep upwards through the final result, filling it in
     // TODO: hop back to original order here for [] syntax.
     long leftLoc=_leftFrom; // sweep through left table along the sorted row locations.  
     long prevf = -1, prevl = -1;
-    for (int jb=0; jb<_ret1st.length; ++jb) {              // jb = j batch
+   // for (int jb=0; jb<_ret1st.length; ++jb) {              // jb = j batch
+    if (jb < _ret1st.length) {
       for (int jo=0; jo<_ret1st[jb].length; ++jo) {        // jo = j offset
         leftLoc++;  // to save jb*_ret1st[0].length + jo;
         long f = _ret1st[jb][jo];  // TODO: take _ret1st[jb] outside inner loop
@@ -680,7 +694,7 @@ class BinaryMerge extends DTask<BinaryMerge> {
           long a = resultLoc + rep;
           // TODO: loop into batches to save / and % for each repeat and still
           // cater for crossing multiple batch boundaries
-          int whichChunk = (int) (a / batchSizeUUID);  
+          int whichChunk = (int) (a / batchSizeUUID);  // this actually points to batch number
           int offset = (int) (a % batchSizeUUID);
 
           for (int col=0; col<chks.length; col++) { // copy over left frame to frameLikeChunks
@@ -745,28 +759,41 @@ class BinaryMerge extends DTask<BinaryMerge> {
         }
       }
     }
+    return resultLoc;
+  }
+
+  private void cleanUpMemory(GetRawRemoteRows[][] grrr, int batchIdx) {
+    if (grrr != null) {
+      int nodeNum = grrr.length;
+      for (int nodeIdx = 0; nodeIdx < nodeNum; nodeIdx++) {
+        if (grrr[nodeIdx] != null) {
+          int batchNum = grrr[nodeIdx].length;
+          if (batchIdx < batchNum) {
+            int chkLen = grrr[nodeIdx][batchIdx]._chk==null?0:grrr[nodeIdx][batchIdx]._chk.length;
+            for (int cindex=0; cindex<chkLen; cindex++)
+              grrr[nodeIdx][batchIdx]._chk[cindex] = null;
+          }
+        }
+      }
+    }
   }
 
   // compress all chunks and store them
-  private void chunksCompressAndStore(final int nbatch, final int numColsInResult, final double[][][] frameLikeChunks, BufferedString[][][] frameLikeChunks4String) {
+  private void chunksCompressAndStore(final int b, final int numColsInResult, final double[][][] frameLikeChunks, BufferedString[][][] frameLikeChunks4String) {
     // compress all chunks and store them
     Futures fs = new Futures();
     for (int col = 0; col < numColsInResult; col++) {
       if (this._stringCols[col]) {
-        for (int b = 0; b < nbatch; b++) {
           NewChunk nc = new NewChunk(null, 0);
           for (int index = 0; index < frameLikeChunks4String[col][b].length; index++)
             nc.addStr(frameLikeChunks4String[col][b][index]);
           Chunk ck = nc.compress();
           DKV.put(getKeyForMSBComboPerCol(_leftSB._msb, _riteSB._msb, col, b), ck, fs, true);
           frameLikeChunks4String[col][b] = null; //free mem as early as possible (it's now in the store)
-        }
       } else {
-        for (int b = 0; b < nbatch; b++) {
           Chunk ck = new NewChunk(frameLikeChunks[col][b]).compress();
           DKV.put(getKeyForMSBComboPerCol(_leftSB._msb, _riteSB._msb, col, b), ck, fs, true);
           frameLikeChunks[col][b] = null; //free mem as early as possible (it's now in the store)
-        }
       }
     }
     fs.blockForPending();
