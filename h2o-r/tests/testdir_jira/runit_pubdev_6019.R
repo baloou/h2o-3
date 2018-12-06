@@ -10,4 +10,4 @@ test.timestamp <- function() {
 
 }
 
-doTest("H2OTree visitor", test.timestamp)
+doTest("Test model timestamp", test.timestamp)
